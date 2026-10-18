@@ -1,0 +1,826 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lakeside</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #3d7cc4; overflow: hidden; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+  #hint, #loading {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    font: 500 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; letter-spacing: .04em;
+    color: rgba(255,255,255,.95); text-shadow: 0 1px 6px rgba(0,0,0,.5);
+    pointer-events: none; transition: opacity 1.5s ease; white-space: nowrap;
+  }
+  #hint { bottom: 26px; }
+  #loading { top: 45%; font-size: 15px; }
+  #mute {
+    position: fixed; top: 16px; right: 16px; width: 40px; height: 40px; border-radius: 50%;
+    border: 0; background: rgba(0,0,0,.28); color: #fff; cursor: pointer; display: grid; place-items: center;
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+  #mute svg { width: 20px; height: 20px; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="loading">Growing the valley…</div>
+<div id="hint">Click the water to start · move to ripple · click to splash · hold to stir</div>
+<button id="mute" aria-label="Mute sound" title="Mute">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11 5 6 9H2v6h4l5 4V5z"/><path id="waves" d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/>
+  </svg>
+</button>
+<script type="module">
+import * as THREE from 'three';
+
+// ---------- scene constants ----------
+const CAM_H = 1.7;                     // eye height above the water (m)
+// The simulation grid follows the perspective: columns fan out from the viewer (x/z) and rows grow
+// geometrically with distance, so every cell is square and the same grid covers the whole lake.
+const SIM_Z0 = 2.6, SIM_ZMAX = 1200, SIM_S = 2.6;  // nearest row, farthest row (m), lateral spread (x/z)
+const SIM_NU = 256, SIM_K = Math.log(SIM_ZMAX / SIM_Z0), SIM_NV = Math.round(SIM_NU * SIM_K / SIM_S);
+const SIM_CREF = 0.03;                             // cell size (m) where waves step at the reference rate
+const STRIPS = 32;                     // the valley is ray-marched once, a strip per frame (small strips keep the GPU responsive)
+// waterfall: one stream plunging in a single drop over a sheer rock band on the right-hand ridge
+const FALL = { x: 850, zc: 2450, drop: 230, base: 260 };   // stream x, cliff line z, cliff height, approx. cliff-foot height (m)
+const gullyX = z => FALL.x + 30 * Math.sin(z * 0.008 + 1.0);
+const SUN = new THREE.Vector3(-0.85, 0.5, -0.15).normalize();    // low from the left, so ridges and gullies model in light and shade
+
+const COMMON = /* glsl */`
+const float CAM_H = ${CAM_H.toFixed(2)};
+const float SIM_Z0 = ${SIM_Z0.toFixed(2)}, SIM_K = ${SIM_K.toFixed(6)}, SIM_S = ${SIM_S.toFixed(2)}, SIM_NU = ${SIM_NU}.0, SIM_CREF = ${SIM_CREF};
+float simCell(float v){ return SIM_Z0 * exp(v * SIM_K) * SIM_S / SIM_NU; }   // metres per cell on row v
+const vec3 SUN_COL = vec3(1.0, 0.95, 0.86) * 2.6;
+const vec3 SKY_AMB = vec3(0.30, 0.42, 0.62) * 0.55;
+const vec3 HAZE = vec3(0.34, 0.49, 0.76);
+float shoreZ(float x){ return 3.0 + max(x - 0.4, 0.0) * 0.45 + 0.06 * sin(x * 2.3) + 0.04 * sin(x * 5.1 + 1.0); }
+vec2 simUv(vec2 p){ return vec2(p.x / p.y / SIM_S + 0.5, log(max(p.y, 0.01) / SIM_Z0) / SIM_K); }
+vec2 simWorld(vec2 uv){ float z = SIM_Z0 * exp(uv.y * SIM_K); return vec2((uv.x - 0.5) * SIM_S * z, z); }
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973)); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.xx + p3.yz) * p3.zy); }
+float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash12(i), hash12(i + vec2(1, 0)), u.x), mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), u.x), u.y); }
+const mat2 ROT = mat2(0.8, -0.6, 0.6, 0.8);
+float fbmN(vec2 p, int oct){ float s = 0.0, a = 0.5, w = 0.0;
+  for (int i = 0; i < oct; i++){ s += a * vnoise(p); w += a; p = ROT * p * 2.03 + vec2(1.7, 9.2); a *= 0.5; } return s / w; }
+float fbm(vec2 p){ return fbmN(p, 5); }
+`;
+const shoreZ = x => 3.0 + Math.max(x - 0.4, 0) * 0.45 + 0.06 * Math.sin(x * 2.3) + 0.04 * Math.sin(x * 5.1 + 1.0);
+
+// ---------- renderer ----------
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+// if the GPU driver resets, ask for the context back and rebuild the page once it returns
+renderer.domElement.addEventListener('webglcontextlost', e => e.preventDefault());
+renderer.domElement.addEventListener('webglcontextrestored', () => location.reload());
+const quadScene = new THREE.Scene(), quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
+quad.frustumCulled = false; quadScene.add(quad);
+const QUAD_VS = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+function draw(mat, target) { quad.material = mat; renderer.setRenderTarget(target); renderer.render(quadScene, quadCam); }
+
+// ---------- the valley: hills, forest, fields, ray-marched once into a texture ----------
+// Everything above the waterline is rendered from the eye point looking north over the lake.
+// env pixel (x, y) = screen pixel (x, horizon + y); it extends above the screen so steep reflections still find sky.
+const terrainMat = new THREE.ShaderMaterial({
+  uniforms: { uEnv: { value: new THREE.Vector2(1, 1) }, uF: { value: 1 }, uSun: { value: SUN }, uMode: { value: 0 } },
+  vertexShader: QUAD_VS,
+  fragmentShader: COMMON + /* glsl */`
+    uniform vec2 uEnv; uniform float uF; uniform vec3 uSun;
+    // value noise with analytic derivatives (quintic, so slopes stay smooth)
+    vec3 noised(vec2 x){
+      vec2 i = floor(x), f = fract(x);
+      vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0), du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+      float a = hash12(i), b = hash12(i + vec2(1, 0)), c = hash12(i + vec2(0, 1)), d = hash12(i + vec2(1, 1));
+      float k1 = b - a, k2 = c - a, k4 = a - b - c + d;
+      return vec3(a + k1 * u.x + k2 * u.y + k4 * u.x * u.y, du * vec2(k1 + k4 * u.y, k2 + k4 * u.x)) * 2.0 - vec3(1.0, 0.0, 0.0);
+    }
+    // erosion-like fbm (Quilez): fine detail is damped wherever the larger shapes are already steep,
+    // which leaves sharp crests, smooth valley floors and branching gullies down the slopes
+    float eroded(vec2 p, int oct){
+      float a = 0.0, b = 0.5; vec2 d = vec2(0.0);
+      for (int i = 0; i < oct; i++) {
+        vec3 n = noised(p); d += n.yz;
+        a += b * n.x / (1.0 + dot(d, d));
+        b *= 0.5; p = ROT * p * 2.0 + vec2(3.1, 1.7);
+      }
+      return a;
+    }
+    float bump(vec2 p, vec2 c, vec2 r){ vec2 d = (p - c) / r; return exp(-dot(d, d)); }
+    const float WX = ${FALL.x}.0, WZC = ${FALL.zc}.0, WDROP = ${FALL.drop}.0;
+    // a stream comes down a gully on the ridge and leaves the lip of one sheer rock band in a single plunge
+    float gullyX(float z){ return WX + 30.0 * sin(z * 0.008 + 1.0); }
+    float gullyAlong(float z){ return smoothstep(WZC - 500.0, WZC - 300.0, z) * (1.0 - smoothstep(WZC + 150.0, WZC + 300.0, z)); }
+    float gullyD(vec2 p){ return abs(p.x - gullyX(p.y)); }
+    float baseH(vec2 p){
+      float h = 0.0;
+      h += 190.0 * bump(p, vec2(-780.0, 1250.0), vec2(520.0, 400.0));      // forested hill, left
+      h += 130.0 * bump(p, vec2(-1350.0, 1550.0), vec2(520.0, 520.0));
+      h += 300.0 * bump(p, vec2(-450.0, 2700.0), vec2(700.0, 520.0));      // valley ridges, middle
+      h += 430.0 * bump(p, vec2(250.0, 3400.0), vec2(1400.0, 700.0));
+      h += 470.0 * smoothstep(-300.0, 2300.0, p.x) * exp(-pow((p.y - 2500.0 - p.x * 0.25) / 800.0, 2.0));   // long ridge, right
+      h += 165.0 * bump(p, vec2(1000.0, 1650.0), vec2(650.0, 330.0));      // lower hill, right
+      h += 1450.0 * smoothstep(5500.0, 9500.0, p.y) * (0.5 + 0.5 * vnoise(vec2(p.x * 0.00035, 1.3)));   // far blue range
+      h += 330.0 * bump(p, vec2(WX, 2650.0), vec2(450.0, 380.0));        // high shoulder of the right ridge
+      // one hard rock band: a single sheer cliff across the ridge face, a plunge basin below it
+      float wallW = 1.0 - smoothstep(70.0, 150.0, gullyD(p) + 70.0 * vnoise(p * 0.012));
+      float zc = WZC + 30.0 * (vnoise(vec2(p.x * 0.015, 4.0)) - 0.5) * smoothstep(20.0, 60.0, gullyD(p));   // ragged cliff line
+      h -= WDROP * wallW * (1.0 - smoothstep(zc - 3.0, zc + 3.0, p.y)) * smoothstep(WZC - 420.0, WZC - 120.0, p.y);
+      // the stream's gully above the lip
+      h -= 22.0 * (1.0 - smoothstep(0.0, 60.0, gullyD(p))) * smoothstep(WZC - 5.0, WZC + 10.0, p.y) * (1.0 - smoothstep(WZC + 300.0, WZC + 450.0, p.y));
+      float land = smoothstep(650.0, 1000.0, p.y + 260.0 * (vnoise(vec2(p.x * 0.0018, 2.0)) - 0.5));
+      h += 6.0 + 35.0 * fbmN(p * 0.0025 + 5.0, 3);                       // low wooded foothills along the far shore
+      return h * land + mix(-25.0, 0.0, land);
+    }
+    float terrain(vec2 p, int oct){
+      float b = baseH(p);
+      float m = smoothstep(0.0, 40.0, b);
+      vec2 q = p * 0.0016;
+      q += (vec2(fbmN(q * 0.7 + 3.1, 3), fbmN(q * 0.7 + 7.7, 3)) - 0.5) * 0.6;
+      float calm = 1.0 - 0.45 * (1.0 - smoothstep(150.0, 320.0, gullyD(p))) * gullyAlong(p.y);
+      return b + eroded(q, oct) * (40.0 + min(b, 500.0) * 0.45) * m * calm;
+    }
+    float crowns(vec2 p){ return vnoise(p * 0.22) * 0.65 + vnoise(p * 0.5 + 3.0) * 0.35; }
+
+    float march(vec3 rd){
+      vec3 ro = vec3(0.0, CAM_H, 0.0);
+      float t = 250.0, tp = t; bool hit = false;
+      for (int i = 0; i < 340; i++) {
+        vec3 p = ro + rd * t;
+        if (p.y > 2300.0 || t > 26000.0) break;
+        float dh = p.y - terrain(p.xz, 4);
+        if (dh < 0.0) { hit = true; break; }
+        tp = t; t += max(dh * 0.45, t * 0.003);
+      }
+      if (!hit) return -1.0;
+      for (int i = 0; i < 7; i++) { float tm = (tp + t) * 0.5; vec3 p = ro + rd * tm; if (p.y < terrain(p.xz, 7)) t = tm; else tp = tm; }
+      return t;
+    }
+    vec4 shade(vec3 rd){
+      float t = march(rd);
+      if (t < 0.0) return vec4(0.0);
+      vec3 p = vec3(0.0, CAM_H, 0.0) + rd * t;
+      float fp = t / uF;                                   // metres covered by one pixel
+      float e = max(0.6, fp);
+      float hc = terrain(p.xz, 9);
+      vec3 n = normalize(vec3(hc - terrain(p.xz + vec2(e, 0.0), 9), e, hc - terrain(p.xz + vec2(0.0, e), 9)));
+      float slope = 1.0 - n.y;
+
+      // ground cover
+      float fieldM = smoothstep(0.56, 0.66, fbmN(p.xz * 0.0015 + 9.0, 4)) * smoothstep(0.0, 700.0, p.x)
+                   * smoothstep(0.5, 0.25, slope) * smoothstep(60.0, 160.0, p.y);
+      float rockM = smoothstep(0.55, 0.75, slope + (vnoise(p.xz * 0.02) - 0.5) * 0.3);
+      float shoreM = (1.0 - smoothstep(0.5, 3.0, p.y)) * smoothstep(0.4, 0.6, vnoise(p.xz * 0.004));   // stony patches, trees elsewhere
+      float forest = (1.0 - fieldM) * (1.0 - rockM) * (1.0 - shoreM);
+
+      // tree crowns: small bumps that catch light, faded once they are smaller than a pixel
+      float ca = smoothstep(3.0, 0.9, fp) * forest;
+      float c0 = crowns(p.xz);
+      vec2 cg = vec2(crowns(p.xz + vec2(0.7, 0.0)) - c0, crowns(p.xz + vec2(0.0, 0.7)) - c0) / 0.7;
+      n = normalize(n + vec3(-cg.x, 0.0, -cg.y) * 1.6 * ca);
+
+      vec3 forestC = mix(vec3(0.016, 0.050, 0.012), vec3(0.040, 0.095, 0.020), vnoise(p.xz * 0.04));
+      forestC = mix(forestC, vec3(0.06, 0.09, 0.03), smoothstep(0.65, 0.85, fbmN(p.xz * 0.006, 3)) * 0.6);
+      forestC *= mix(1.0, 0.55 + 0.75 * c0, smoothstep(6.0, 1.0, fp));
+      forestC *= 0.65 + 0.7 * fbmN(p.xz * 0.035, 3);                      // clumps of taller and darker trees
+      vec2 fq = mat2(0.9, 0.43, -0.43, 0.9) * p.xz / vec2(55.0, 35.0);
+      vec3 fieldC = mix(vec3(0.09, 0.13, 0.03), vec3(0.24, 0.20, 0.08), hash12(floor(fq)));
+      fieldC *= 0.82 + 0.18 * step(0.18, fract(p.y / 5.0));       // terraces
+      float strata = vnoise(vec2((p.x + p.z) * 0.02, p.y * 0.22));
+      vec3 rockC = vec3(0.17, 0.15, 0.12) * (0.7 + 0.5 * strata) * (0.8 + 0.4 * vnoise(p.xz * 0.1));
+      vec2 rq = vec2((p.x + p.z) * 0.06, p.y * 0.09);
+      float r0 = fbmN(rq, 3);
+      n = normalize(n + rockM * vec3((fbmN(rq + vec2(0.05, 0.0), 3) - r0) * 14.0, (fbmN(rq + vec2(0.0, 0.05), 3) - r0) * 14.0, 0.0));
+      vec3 shoreC = vec3(0.26, 0.23, 0.19) * (0.8 + 0.4 * vnoise(p.xz * 0.3));
+      vec3 alb = forestC * forest + fieldC * fieldM * (1.0 - rockM) * (1.0 - shoreM) + rockC * rockM * (1.0 - shoreM) + shoreC * shoreM;
+      // the rock bands: dark wet rock with vertical water stains and moss on the ledges, wettest in the gully
+      float faceZone = (1.0 - smoothstep(150.0, 300.0, gullyD(p.xz))) * gullyAlong(p.z) * rockM;
+      vec3 wetRock = vec3(0.15, 0.14, 0.12) * (0.7 + 0.5 * strata) * (0.75 + 0.35 * vnoise(vec2(p.x * 0.15, p.y * 0.01)))
+                   * (1.0 - 0.4 * smoothstep(0.55, 0.8, vnoise(vec2(p.x * 0.06, p.y * 0.003 + 3.0))));
+      wetRock = mix(wetRock, vec3(0.07, 0.11, 0.04), smoothstep(0.6, 0.8, vnoise(p.xz * 0.08 + p.y * 0.05)) * 0.7);
+      wetRock *= 1.0 - 0.4 * (1.0 - smoothstep(15.0, 60.0, gullyD(p.xz)));
+      alb = mix(alb, wetRock, faceZone);
+
+      // soft sun shadow from the terrain itself
+      float sh = 1.0; vec3 q = p + n * 2.0; float s = 8.0;
+      for (int i = 0; i < 40; i++) {
+        vec3 r = q + uSun * s;
+        float d = r.y - terrain(r.xz, 4);
+        sh = min(sh, clamp(10.0 * d / s, 0.0, 1.0));
+        if (sh < 0.01 || r.y > 2300.0) break;
+        s *= 1.17;
+      }
+      float dif = max(dot(n, uSun), 0.0) * mix(1.0, 0.8, forest);
+      float r = max(12.0, fp * 3.0);
+      float hn = (terrain(p.xz + vec2(r, 0.0), 6) + terrain(p.xz - vec2(r, 0.0), 6) + terrain(p.xz + vec2(0.0, r), 6) + terrain(p.xz - vec2(0.0, r), 6)) * 0.25;
+      float cav = clamp(0.8 + (hc - hn) / r * 0.9, 0.35, 1.15);           // gullies sit in shade, crests catch the sky
+      vec3 amb = mix(SKY_AMB, vec3(0.20, 0.26, 0.24) * 0.55, forest * 0.6);
+      vec3 col = alb * (SUN_COL * 1.15 * dif * sh * mix(1.0, cav, 0.5) + amb * 0.7 * (0.55 + 0.45 * n.y) * cav);
+
+      // air between the viewer and the hills: distant ridges fade into blue
+      vec3 ext = exp(-t * vec3(0.00007, 0.00010, 0.00016));
+      col = col * ext + HAZE * 0.9 * (1.0 - ext);
+      return vec4(col, 1.0);
+    }
+
+    uniform float uMode;
+    void main(){
+      vec2 fc = gl_FragCoord.xy;
+      if (uMode > 0.5) {          // where the cliff face is visible: (across, up, on-face, distance)
+        vec3 rd = normalize(vec3((fc.x - uEnv.x * 0.5) / uF, fc.y / uF, 1.0));
+        float t = march(rd);
+        if (t < 0.0) { gl_FragColor = vec4(0.0); return; }
+        vec3 p = vec3(0.0, CAM_H, 0.0) + rd * t;
+        float hw = 18.0;                                        // a 36 m wide ribbon
+        float lip = baseH(vec2(gullyX(WZC + 15.0), WZC + 15.0)), foot = baseH(vec2(gullyX(WZC - 30.0), WZC - 30.0));
+        float onFace = (1.0 - smoothstep(hw * 0.7, hw, gullyD(p.xz))) * step(WZC - 70.0, p.z) * step(p.z, WZC + 25.0) * step(foot - 15.0, p.y);
+        gl_FragColor = vec4((p.x - gullyX(p.z)) / (2.0 * hw) + 0.5, (p.y - foot) / max(lip - foot, 1.0), onFace, t * 1e-4);
+        return;
+      }
+      vec4 acc = vec4(0.0);
+      for (int k = 0; k < 2; k++) {                         // two rays per pixel for clean ridgelines
+        vec2 o = k == 0 ? vec2(-0.25, -0.25) : vec2(0.25, 0.25);
+        vec3 rd = normalize(vec3((fc.x + o.x - uEnv.x * 0.5) / uF, (fc.y + o.y) / uF, 1.0));
+        acc += shade(rd);
+      }
+      gl_FragColor = acc * 0.5;     // premultiplied, alpha = coverage
+    }`,
+});
+
+// sky + drifting cumulus + the valley, composed every frame
+const envMat = new THREE.ShaderMaterial({
+  uniforms: { uTerrain: { value: null }, uWF: { value: null }, uEnv: { value: new THREE.Vector2(1, 1) }, uF: { value: 1 }, uTime: { value: 0 },
+    uMist: { value: new THREE.Vector2() }, uMistR: { value: 1 } },
+  vertexShader: QUAD_VS,
+  fragmentShader: COMMON + /* glsl */`
+    uniform sampler2D uTerrain, uWF; uniform vec2 uEnv, uMist; uniform float uF, uTime, uMistR;
+    float cloudD(vec2 a){
+      vec2 q = vec2(a.x * 2.6 + uTime * 0.0025, a.y * 5.5);
+      float cov = 0.85 + 0.6 * (vnoise(vec2(a.x * 1.1 + 4.0, 0.5)) - 0.5);
+      float band = 1.0 - smoothstep(0.03, 0.36, a.y);
+      float base = smoothstep(0.035, 0.075, a.y + 0.025 * vnoise(vec2(a.x * 3.0, 1.0)));
+      return (fbmN(q, 6) * 1.2 + band * 0.55 * cov - 0.9) * base;
+    }
+    void main(){
+      vec2 fc = gl_FragCoord.xy;
+      vec3 rd = normalize(vec3((fc.x - uEnv.x * 0.5) / uF, fc.y / uF, 1.0));
+      vec2 a = vec2(rd.x / rd.z, rd.y / length(rd.xz));
+      vec3 col = mix(HAZE * 1.05, vec3(0.03, 0.13, 0.48), pow(clamp(a.y / 0.8, 0.0, 1.0), 0.5));
+      float d = cloudD(a);
+      if (d > -0.05) {
+        float ds = cloudD(a + vec2(-0.004, 0.008));     // toward the light: brighter rims, grey hollows
+        float lit = clamp(0.72 + (d - ds) * 5.0 + 0.3 * smoothstep(0.05, 0.22, a.y), 0.0, 1.0);
+        vec3 cc = mix(vec3(0.46, 0.53, 0.66), vec3(1.0, 0.99, 0.97) * 1.25, lit);
+        cc = mix(cc, HAZE * 1.1, (1.0 - smoothstep(0.0, 0.09, a.y)) * 0.45);
+        col = mix(col, cc, smoothstep(0.0, 0.16, d));
+      }
+      vec4 tr = texture2D(uTerrain, fc / uEnv);
+      col = col * (1.0 - tr.a) + tr.rgb;
+
+      // the waterfall, painted onto the cliff face where it is visible
+      vec4 wf = texture2D(uWF, fc / uEnv);
+      if (wf.z > 0.01) {
+        float u = wf.x, fall = 1.0 - clamp(wf.y, 0.0, 1.1);           // 0 at the lip, 1 at the foot
+        float edge = smoothstep(0.0, 0.18, u) * smoothstep(1.0, 0.82, u);
+        float strands = vnoise(vec2(u * 7.0, 0.5)) * 0.6 + vnoise(vec2(u * 17.0, 2.0)) * 0.4;
+        float s = fbmN(vec2(u * 8.0, fall * 14.0 - uTime * 1.8), 4);     // white water racing down
+        // a solid sheet at the lip that frays into strands and spray as it falls
+        float dens = edge * mix(0.85 + 0.15 * s, (0.45 + 0.55 * strands) * (0.6 + 0.5 * s), smoothstep(0.1, 0.9, fall));
+        vec3 wc = mix(vec3(0.60, 0.66, 0.71), vec3(1.0, 1.0, 0.98) * 1.2, smoothstep(0.3, 0.7, s));
+        vec3 ex = exp(-wf.w * 1e4 * vec3(0.00007, 0.00010, 0.00016));
+        wc = wc * ex + HAZE * 0.9 * (1.0 - ex);
+        col = mix(col, wc, wf.z * dens);
+      }
+      // spray and mist boiling up from the plunge pool
+      vec2 md = (fc - uMist) / uMistR;
+      float mr = length(md * vec2(0.8, 1.1));
+      if (mr < 1.8) {
+        float m = fbmN(vec2(md.x * 1.5, md.y * 1.5 - uTime * 0.25) + 3.0, 4);
+        float mist = smoothstep(1.4, 0.15, mr + (0.5 - m) * 0.9) * 0.7 * smoothstep(-0.9, -0.2, md.y);
+        col = mix(col, HAZE * 0.45 + vec3(0.62, 0.65, 0.68), mist);
+      }
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+});
+
+// ---------- water simulation ----------
+const ext = renderer.extensions;
+const simType = (ext.has('EXT_color_buffer_float') && ext.has('OES_texture_float_linear')) ? THREE.FloatType : THREE.HalfFloatType;
+const mkRT = () => new THREE.WebGLRenderTarget(SIM_NU, SIM_NV, {
+  type: simType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false,
+});
+let simA = mkRT(), simB = mkRT();
+const delta = new THREE.Vector2(1 / SIM_NU, 1 / SIM_NV);
+const dropMat = new THREE.ShaderMaterial({
+  uniforms: { uTex: { value: null }, uA: { value: new THREE.Vector2() }, uB: { value: new THREE.Vector2() }, uRadius: { value: 0 }, uStrength: { value: 0 }, uCells: { value: new THREE.Vector2(SIM_NU, SIM_NV) } },
+  vertexShader: QUAD_VS,
+  fragmentShader: /* glsl */`
+    uniform sampler2D uTex; uniform vec2 uA, uB, uCells; uniform float uRadius, uStrength; varying vec2 vUv;
+    void main(){
+      vec4 info = texture2D(uTex, vUv);
+      vec2 pa = (vUv - uA) * uCells, ba = (uB - uA) * uCells;     // measured in cells
+      float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-9), 0.0, 1.0);
+      float d = max(0.0, 1.0 - length(pa - ba * h) / uRadius);
+      info.r += (0.5 - cos(d * 3.14159265) * 0.5) * uStrength;
+      gl_FragColor = info;
+    }`,
+});
+const updateMat = new THREE.ShaderMaterial({
+  uniforms: { uTex: { value: null }, uDelta: { value: delta } },
+  vertexShader: QUAD_VS,
+  fragmentShader: COMMON + /* glsl */`
+    uniform sampler2D uTex; uniform vec2 uDelta; varying vec2 vUv;
+    void main(){
+      vec2 p = simWorld(vUv);
+      if (p.y < shoreZ(p.x) + 0.02) { gl_FragColor = vec4(0.0); return; }
+      vec4 info = texture2D(uTex, vUv);
+      float avg = (texture2D(uTex, vUv - vec2(uDelta.x, 0.0)).r + texture2D(uTex, vUv + vec2(uDelta.x, 0.0)).r +
+                   texture2D(uTex, vUv - vec2(0.0, uDelta.y)).r + texture2D(uTex, vUv + vec2(0.0, uDelta.y)).r) * 0.25;
+      // real ripples travel at the same speed in metres everywhere, so far (bigger) cells update more gently
+      float c = SIM_CREF / simCell(vUv.y);
+      info.g += (avg - info.r) * min(1.4 * c * c, 1.9);
+      info.g *= 0.996;
+      info.r += info.g;
+      // soak up waves at the open edges so the patch boundary never shows
+      float e = min(min(vUv.x, 1.0 - vUv.x), 1.0 - vUv.y);
+      float sponge = mix(0.94, 1.0, smoothstep(0.0, 0.07, e));
+      info.r *= sponge * 0.9995; info.g *= sponge;
+      info.rg = clamp(info.rg, -1.0, 1.0);
+      if (isnan(info.r) || isnan(info.g) || isinf(info.r) || isinf(info.g)) info = vec4(0.0);   // never let one bad value freeze the lake
+      gl_FragColor = info;
+    }`,
+});
+const normalMat = new THREE.ShaderMaterial({
+  uniforms: { uTex: { value: null }, uDelta: { value: delta } },
+  vertexShader: QUAD_VS,
+  fragmentShader: COMMON + /* glsl */`
+    uniform sampler2D uTex; uniform vec2 uDelta; varying vec2 vUv;
+    void main(){
+      vec4 info = texture2D(uTex, vUv);
+      float hx = texture2D(uTex, vUv + vec2(uDelta.x, 0.0)).r;
+      float hz = texture2D(uTex, vUv + vec2(0.0, uDelta.y)).r;
+      info.ba = normalize(vec3(info.r - hx, simCell(vUv.y), info.r - hz)).xz;   // true slope in metres
+      gl_FragColor = info;
+    }`,
+});
+function simPass(mat) {
+  mat.uniforms.uTex.value = simA.texture;
+  draw(mat, simB);
+  [simA, simB] = [simB, simA];
+}
+const toSim = (x, z) => new THREE.Vector2(x / z / SIM_S + 0.5, Math.log(z / SIM_Z0) / SIM_K);
+const cellSize = z => z * SIM_S / SIM_NU;   // metres per cell at distance z
+const drops = [];
+// a touch has a real size in metres; where that is smaller than the grid, spread it over 1.5 cells
+// and lower it so the displaced water stays the same (far touches come out small and weak, as they should)
+const addDrop = (a, b, r, s) => {
+  let rc = r / cellSize(a.z);
+  if (rc < 1.5) { s *= (rc / 1.5) ** 2; rc = 1.5; }
+  drops.push({ a: toSim(a.x, a.z), b: toSim(b.x, b.z), r: rc, s });
+};
+
+// ---------- final image: valley above the waterline, live water below ----------
+const U = {
+  uEnvTex: { value: null }, uSim: { value: simA.texture }, uTime: { value: 0 },
+  uRes: { value: new THREE.Vector2() }, uEnvH: { value: 1 }, uHor: { value: 0 }, uF: { value: 1 }, uSun: { value: SUN },
+};
+const sceneMat = new THREE.ShaderMaterial({
+  uniforms: U,
+  vertexShader: QUAD_VS,
+  fragmentShader: COMMON + /* glsl */`
+    uniform sampler2D uEnvTex, uSim; uniform vec2 uRes; uniform float uTime, uEnvH, uHor, uF; uniform vec3 uSun;
+
+    vec3 voronoi(vec2 x){
+      vec2 n = floor(x), f = fract(x); float m1 = 8.0, m2 = 8.0, id = 0.0;
+      for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+        vec2 g = vec2(float(i), float(j)); vec2 r = g + hash22(n + g) * 0.85 - f; float d = dot(r, r);
+        if (d < m1) { m2 = m1; m1 = d; id = hash12(n + g); } else if (d < m2) m2 = d;
+      }
+      return vec3(sqrt(m1), sqrt(m2) - sqrt(m1), id);
+    }
+    float causticTex(vec2 uv, float time){
+      vec2 p = mod(uv * 6.28318, 6.28318) - 250.0; vec2 i = p; float c = 1.0;
+      for (int n = 0; n < 4; n++) {
+        float t = time * (1.0 - (3.5 / float(n + 1)));
+        i = p + vec2(cos(t - i.x) + sin(t + i.y), sin(t - i.y) + cos(t + i.x));
+        c += 1.0 / length(vec2(p.x / (sin(i.x + t) / 0.005), p.y / (cos(i.y + t) / 0.005)));
+      }
+      c /= 4.0; c = 1.17 - pow(c, 1.4);
+      return pow(abs(c), 8.0);
+    }
+    vec3 lin(vec3 c){ return pow(c, vec3(2.2)); }
+    vec3 env(vec2 s){ return texture2D(uEnvTex, clamp(vec2(s.x / uRes.x, (s.y - uHor) / uEnvH), 0.001, 0.999)).rgb; }
+
+    vec3 lakeBed(vec2 p, float depth){
+      vec3 v1 = voronoi(p * 5.0), v2 = voronoi(p * 13.0 + 3.7);
+      vec3 sand = vec3(0.62, 0.56, 0.46) * (0.85 + 0.3 * vnoise(p * 40.0));
+      vec3 pc1 = mix(vec3(0.40, 0.38, 0.35), vec3(0.66, 0.61, 0.53), v1.z) * (0.72 + 0.28 * smoothstep(0.0, 0.18, v1.y));
+      vec3 pc2 = mix(vec3(0.38, 0.36, 0.33), vec3(0.60, 0.56, 0.50), v2.z) * (0.75 + 0.25 * smoothstep(0.0, 0.15, v2.y));
+      vec3 bed = mix(sand, pc2, smoothstep(0.03, 0.09, v2.y) * step(0.45, fract(v2.z * 13.1)));
+      bed = mix(bed, pc1, smoothstep(0.03, 0.10, v1.y) * step(0.6, fract(v1.z * 5.7)));
+      vec3 silt = vec3(0.22, 0.23, 0.17) * (0.8 + 0.4 * fbm(p * 1.5));
+      bed = mix(bed, silt, smoothstep(0.6, 2.2, depth));
+      return lin(bed);
+    }
+
+    void main(){
+      vec2 fc = gl_FragCoord.xy;
+      if (fc.y >= uHor) {
+        gl_FragColor = vec4(env(fc), 1.0);
+        #include <colorspace_fragment>
+        return;
+      }
+
+      // the water plane under this pixel
+      float dy = max(uHor - fc.y, 0.35);
+      float z = min(CAM_H * uF / dy, 4000.0);
+      float x = (fc.x - uRes.x * 0.5) * z / uF;
+      vec2 P = vec2(x, z);
+      vec3 D = normalize(vec3(x, -CAM_H, z));
+      float t = uTime;
+
+      // ---- water ----
+      vec2 su = simUv(P);
+      float inSim = step(0.0, su.x) * step(su.x, 1.0) * step(0.0, su.y) * step(su.y, 1.0);
+      vec2 nxz = texture2D(uSim, su).ba * inSim;
+      // faint breeze: long, flat ripples that stretch sideways, fading with distance
+      vec2 q = P * vec2(0.55, 1.6);
+      float e = 0.04;
+      float w0 = vnoise(q * 2.0 + t * vec2(0.12, 0.35)) + 0.5 * vnoise(q * 4.7 - t * vec2(0.2, 0.25));
+      float wx = vnoise((q + vec2(e, 0.0)) * 2.0 + t * vec2(0.12, 0.35)) + 0.5 * vnoise((q + vec2(e, 0.0)) * 4.7 - t * vec2(0.2, 0.25));
+      float wz = vnoise((q + vec2(0.0, e)) * 2.0 + t * vec2(0.12, 0.35)) + 0.5 * vnoise((q + vec2(0.0, e)) * 4.7 - t * vec2(0.2, 0.25));
+      vec2 breeze = vec2(wx - w0, wz - w0) / e * 0.0045 * smoothstep(45.0, 6.0, z);
+      vec3 n = normalize(vec3(nxz.x, sqrt(max(1.0 - dot(nxz, nxz), 0.0)), nxz.y) + vec3(breeze.x, 0.0, breeze.y));
+
+      // reflection: follow the bounced ray back up into the valley
+      vec3 R = reflect(D, n);
+      R.y = max(R.y, 1e-4); R.z = max(R.z, 1e-3);
+      vec3 refl = env(vec2(uRes.x * 0.5 + uF * R.x / R.z, uHor + uF * R.y / R.z)) * 0.93;
+
+      // refraction: lake bed seen through clear water
+      float depth = clamp(0.02 + (z - shoreZ(x)) * 0.35, 0.0, 8.0);
+      vec3 T = refract(D, n, 1.0 / 1.33);
+      float L = depth / max(-T.y, 0.05);
+      vec2 B = P + T.xz * L;
+      vec2 cp = B + uSun.xz / uSun.y * depth * 0.75;
+      vec2 cu = simUv(cp); vec2 px = vec2(2.0 / ${SIM_NU}.0, 2.0 / ${SIM_NV}.0);
+      float div = (texture2D(uSim, cu + vec2(px.x, 0.0)).b - texture2D(uSim, cu - vec2(px.x, 0.0)).b
+                 + texture2D(uSim, cu + vec2(0.0, px.y)).a - texture2D(uSim, cu - vec2(0.0, px.y)).a) * inSim;
+      float caus = 0.7 + (causticTex(cp * 0.45, t * 0.5 + 23.0) * 1.2 + clamp(div * (2.0 + depth * 6.0), -0.6, 1.6))
+                       * smoothstep(0.0, 0.06, depth) * exp(-depth * 0.6);
+      vec3 bedLit = lakeBed(B, depth) * (vec3(1.0, 0.95, 0.86) * 1.55 * uSun.y * caus + vec3(0.18, 0.24, 0.32));
+      vec3 k = vec3(0.42, 0.10, 0.075);
+      vec3 Tv = exp(-k * L);
+      vec3 under = bedLit * Tv * exp(-k * depth / uSun.y) + vec3(0.004, 0.022, 0.036) * (1.0 - Tv);
+
+      float F = 0.02 + 0.98 * pow(1.0 - max(dot(-D, n), 0.0), 5.0);
+      vec3 water = mix(under, refl, F);
+
+      // ---- sandy shore with lapping wavelets ----
+      float lap = 0.05 * sin(t * 0.8 + x * 0.6) + 0.03 * sin(t * 1.3 - x * 1.1 + 2.0) - 0.035;
+      float sz = shoreZ(x) + lap;
+      vec3 v1 = voronoi(P * 9.0);
+      vec3 sandA = vec3(0.80, 0.75, 0.66) * (0.88 + 0.24 * vnoise(P * 60.0)) * (0.92 + 0.16 * fbm(P * 3.0));
+      vec3 pebble = mix(vec3(0.45, 0.43, 0.40), vec3(0.70, 0.66, 0.60), v1.z) * (0.7 + 0.3 * smoothstep(0.0, 0.15, v1.y));
+      sandA = mix(sandA, pebble, smoothstep(0.03, 0.08, v1.y) * step(0.8, fract(v1.z * 9.3)));
+      float wet = smoothstep(shoreZ(x) - 0.35, shoreZ(x) + 0.02, z);
+      vec3 sandAlb = lin(sandA) * mix(1.0, 0.55, wet);
+      float shadeS = smoothstep(0.42, 0.62, fbm(P * 1.2 + vec2(sin(t * 0.35), cos(t * 0.27)) * 0.03));
+      vec3 sand = sandAlb * (vec3(1.0, 0.95, 0.86) * 1.2 * mix(1.0, 0.35, shadeS) + vec3(0.20, 0.26, 0.34));
+      sand += refl * 0.06 * wet;
+
+      float fw = fwidth(z) * 1.5;
+      float landMix = 1.0 - smoothstep(-fw, fw, z - sz);
+      vec3 col = mix(water, sand, landMix);
+      float foam = (1.0 - smoothstep(0.0, 0.035 + fw, abs(z - sz))) * (0.25 + 0.35 * vnoise(vec2(x * 14.0, t * 2.0)));
+      col += vec3(0.85, 0.88, 0.9) * foam * 0.5;
+
+      gl_FragColor = vec4(col, 1.0);
+      #include <colorspace_fragment>
+    }`,
+});
+
+// ---------- layout ----------
+const lay = { W: 0, H: 0, hor: 0, f: 1 };   // CSS px; hor measured from the bottom
+let terrainRT = null, envRT = null, wfRT = null, strip = 0, resizeTimer = 0;
+const loading = document.getElementById('loading');
+function layout() {
+  const W = innerWidth, H = innerHeight, dpr = renderer.getPixelRatio();
+  Object.assign(lay, { W, H, hor: H * 0.62, f: H * 1.1 });
+  const envCss = Math.max(H - lay.hor, lay.hor) * 1.15;
+  const es = Math.min(dpr, 1);                      // the valley texture never exceeds CSS resolution
+  const EW = Math.round(W * es), EH = Math.round(envCss * es);
+  terrainRT?.dispose(); envRT?.dispose(); wfRT?.dispose();
+  terrainRT = new THREE.WebGLRenderTarget(EW, EH, { type: THREE.HalfFloatType, depthBuffer: false });
+  terrainRT.scissorTest = true;
+  // waterfall face coordinates: only the small box around the falls is ever traced
+  wfRT = new THREE.WebGLRenderTarget(EW, EH, { type: THREE.HalfFloatType, depthBuffer: false, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
+  wfRT.scissorTest = true;
+  const fE = lay.f * es, proj = (x, y, z) => [EW / 2 + x / z * fE, (y - CAM_H) / z * fE];
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  for (const x of [FALL.x - 90, FALL.x + 90])
+    for (const y of [FALL.base - 80, FALL.base + FALL.drop + 100]) for (const z of [FALL.zc - 60, FALL.zc + 30]) {
+      const [px, py] = proj(x, y, z); x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+    }
+  x0 = Math.max(0, Math.floor(x0 - 4)); y0 = Math.max(0, Math.floor(y0 - 4));
+  wfRT.scissor.set(x0, y0, Math.max(1, Math.min(EW, Math.ceil(x1 + 4)) - x0), Math.max(1, Math.min(EH, Math.ceil(y1 + 4)) - y0));
+  envMat.uniforms.uWF.value = wfRT.texture;
+  envMat.uniforms.uMist.value.set(...proj(gullyX(FALL.zc - 40), FALL.base + 20, FALL.zc - 40));
+  envMat.uniforms.uMistR.value = 70 / (FALL.zc - 40) * fE;
+  envRT = new THREE.WebGLRenderTarget(EW, EH, {
+    type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter,
+  });
+  for (const m of [terrainMat, envMat]) { m.uniforms.uEnv.value.set(EW, EH); m.uniforms.uF.value = lay.f * es; }
+  envMat.uniforms.uTerrain.value = terrainRT.texture;
+  U.uEnvTex.value = envRT.texture;
+  U.uRes.value.set(W * dpr, H * dpr);
+  U.uEnvH.value = envCss * dpr; U.uHor.value = lay.hor * dpr; U.uF.value = lay.f * dpr;
+  strip = 0;
+}
+layout();
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(layout, 250);
+});
+
+// ---------- sound: every water noise is built from ringing air bubbles ----------
+// Physics (Minnaert 1933; van den Doel 2005; Pumphrey & Crum; Cambridge drip study): the splash itself is
+// nearly silent. What we hear is air trapped under the surface, ringing as a decaying sine whose pitch rises
+// as it nears the surface. Its size sets the pitch: f ≈ 3.26 kHz / radius in mm.
+const audio = (() => {
+  let ctx = null, master, verb, slosh, sloshF, noiseBuf, muted = false;
+  const splashes = [], grains = [], fizzes = [];
+  const r = Math.random;
+  // bubble radius (mm) with a power-law spread: many small, few large
+  const sizeDist = (lo, hi, k = 2.5) => { const a = Math.pow(lo, 1 - k), b = Math.pow(hi, 1 - k); return Math.pow(a + (b - a) * r(), 1 / (1 - k)); };
+
+  function bubble(L, R, sr, t0, radiusMm, amp, pan, stretch = 3) {
+    const f0 = 3260 / radiusMm;                                  // Minnaert resonance
+    const damp = 0.043 + 0.0011 * Math.sqrt(f0);                 // thermal + viscous + radiation losses
+    const beta = Math.PI * f0 * damp / stretch;                  // decay rate (1/s), stretched a little for the ear
+    const xi = 0.1;                                              // pitch rise near the surface
+    const n0 = Math.floor(t0 * sr), n = Math.min(L.length - n0, Math.floor(6 / beta * sr));
+    if (n <= 0) return;
+    const gl = Math.cos((pan + 1) * Math.PI / 4), gr = Math.sin((pan + 1) * Math.PI / 4);
+    let ph = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      ph += 2 * Math.PI * f0 * (1 + xi * beta * t) / sr;
+      const s = Math.sin(ph) * Math.exp(-beta * t) * Math.min(1, i / (sr * 0.0005)) * amp;
+      L[n0 + i] += s * gl; R[n0 + i] += s * gr;
+    }
+  }
+  // filtered noise burst (the faint impact, spray hiss)
+  function burst(L, R, sr, t0, attack, tau, amp, lp, hp) {
+    const n0 = Math.floor(t0 * sr), n = Math.min(L.length - n0, Math.floor((attack + tau * 7) * sr));
+    let a = 0, b = 0, prev = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr, env = t < attack ? t / attack : Math.exp(-(t - attack) / tau);
+      a += ((r() * 2 - 1) - a) * lp;
+      const h = a - prev; prev = a;
+      b += (h * hp + a * (1 - hp) - b) * 0.9;
+      const s = b * env * amp;
+      L[n0 + i] += s * (0.9 + r() * 0.2); R[n0 + i] += s * (0.9 + r() * 0.2);
+    }
+  }
+  const newBuf = secs => { const sr = ctx.sampleRate, b = ctx.createBuffer(2, Math.floor(sr * secs), sr); return [b, b.getChannelData(0), b.getChannelData(1), sr]; };
+
+  function makeSplash() {
+    const [buf, L, R, sr] = newBuf(1.5);
+    burst(L, R, sr, 0, 0.0008, 0.004, 0.08, 0.6, 0.5);           // the impact itself: barely audible
+    burst(L, R, sr, 0.003, 0.012, 0.09, 0.06, 0.4, 0.85);        // crown spray hiss
+    const pinch = 0.04 + r() * 0.04;                             // the cavity pinches off 40–80 ms later…
+    bubble(L, R, sr, pinch, 5 + r() * 4, 0.6, (r() - 0.5) * 0.2, 4);              // …trapping a big bubble: the "plunk"
+    bubble(L, R, sr, pinch + 0.004 + r() * 0.02, 2.5 + r() * 2, 0.22, (r() - 0.5) * 0.4);
+    const drops = 25 + Math.floor(r() * 20);
+    for (let i = 0; i < drops; i++) {                             // spray raining back over ~0.6 s
+      const t0 = pinch + 0.06 + Math.pow(r(), 1.6) * 0.6, fade = Math.exp(-(t0 - 0.1) * 2.2), pan = r() * 1.2 - 0.6;
+      if (r() < 0.55) { const rad = sizeDist(0.6, 4); bubble(L, R, sr, t0, rad, 0.05 * rad * fade, pan); }   // only some drops trap a bubble
+      else burst(L, R, sr, t0, 0.0005, 0.002, 0.03 * fade, 0.7, 0.6);
+    }
+    return buf;
+  }
+  function makeGrain() {                                          // a bubble or two shed by the moving hand
+    const [buf, L, R, sr] = newBuf(0.3);
+    const rad = sizeDist(1.2, 7);
+    bubble(L, R, sr, 0.002, rad, 0.12 * rad, r() * 1.4 - 0.7);
+    if (r() < 0.4) { const r2 = sizeDist(1, 4); bubble(L, R, sr, 0.01 + r() * 0.05, r2, 0.1 * r2, r() - 0.5); }
+    return buf;
+  }
+  function makeFizz() {                                           // a wavelet breaking on sand: a cloud of tiny bubbles
+    const [buf, L, R, sr] = newBuf(0.9);
+    burst(L, R, sr, 0, 0.05, 0.12, 0.05, 0.3, 0.8);
+    for (let i = 0; i < 30; i++) {
+      const t0 = Math.pow(r(), 1.5) * 0.6, rad = sizeDist(0.4, 2.5);
+      bubble(L, R, sr, t0, rad, 0.06 * rad * Math.exp(-t0 * 3), r() * 1.6 - 0.8);
+    }
+    return buf;
+  }
+  function play(buf, gain, rate = 1, toVerb = 0.25) {
+    const s = ctx.createBufferSource(), g = ctx.createGain();
+    s.buffer = buf; s.playbackRate.value = rate; g.gain.value = gain;
+    s.connect(g); g.connect(master);
+    if (toVerb) { const v = ctx.createGain(); v.gain.value = toVerb; g.connect(v).connect(verb); }
+    s.start();
+  }
+  function noiseSrc() { const s = ctx.createBufferSource(); s.buffer = noiseBuf; s.loop = true; s.start(0, r() * 3); return s; }
+  const pick = a => a[Math.floor(r() * a.length)];
+
+  function lapLoop() {
+    // a small wave: low swell as it runs up the sand, then the fizz of it breaking
+    const now = ctx.currentTime, src = noiseSrc(), lp = ctx.createBiquadFilter(), g = ctx.createGain();
+    const len = 1.6 + r() * 1.4, peak = 0.04 + r() * 0.04;
+    lp.type = 'lowpass'; lp.frequency.setValueAtTime(260, now);
+    lp.frequency.linearRampToValueAtTime(800, now + len * 0.35); lp.frequency.linearRampToValueAtTime(220, now + len);
+    g.gain.setValueAtTime(0, now); g.gain.linearRampToValueAtTime(peak, now + len * 0.35); g.gain.exponentialRampToValueAtTime(0.0005, now + len);
+    src.connect(lp).connect(g).connect(master); src.stop(now + len + 0.1);
+    setTimeout(() => play(pick(fizzes), 0.35 + r() * 0.3, 0.9 + r() * 0.2, 0.15), len * 0.3 * 1000);
+    setTimeout(lapLoop, (1.8 + r() * 2.6) * 1000);
+  }
+  function bird() {
+    const now = ctx.currentTime, pan = ctx.createStereoPanner(), g = ctx.createGain();
+    pan.pan.value = r() * 1.6 - 0.8; g.gain.value = 0.015 + r() * 0.02;
+    g.connect(pan).connect(master);
+    const v = ctx.createGain(); v.gain.value = 0.5; g.connect(v).connect(verb);
+    const base = 2600 + r() * 2000, notes = 2 + Math.floor(r() * 5), gap = 0.08 + r() * 0.1;
+    for (let i = 0; i < notes; i++) {
+      const o = ctx.createOscillator(), ng = ctx.createGain(), t0 = now + i * gap, d = 0.05 + r() * 0.07;
+      const f0 = base * (0.85 + r() * 0.3);
+      o.frequency.setValueAtTime(f0, t0);
+      o.frequency.exponentialRampToValueAtTime(f0 * (r() < 0.5 ? 1.35 : 0.7), t0 + d);
+      ng.gain.setValueAtTime(0, t0); ng.gain.linearRampToValueAtTime(1, t0 + 0.012); ng.gain.exponentialRampToValueAtTime(0.001, t0 + d);
+      o.connect(ng).connect(g); o.start(t0); o.stop(t0 + d + 0.02);
+    }
+    setTimeout(bird, (1.5 + r() * 6) * 1000);
+  }
+  return {
+    start() {
+      if (ctx) { ctx.resume(); return; }
+      ctx = new AudioContext();
+      master = ctx.createGain(); master.gain.value = muted ? 0 : 0.9; master.connect(ctx.destination);
+      // open air: a short, soft, dark reverb tail
+      verb = ctx.createConvolver();
+      const sr = ctx.sampleRate, ir = ctx.createBuffer(2, Math.floor(sr * 1.6), sr);
+      for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); let a = 0;
+        for (let i = 0; i < d.length; i++) { a += ((r() * 2 - 1) - a) * 0.25; d[i] = a * Math.exp(-i / (sr * 0.32)); } }
+      verb.buffer = ir; const vg = ctx.createGain(); vg.gain.value = 0.5; verb.connect(vg).connect(master);
+      noiseBuf = ctx.createBuffer(1, sr * 4, sr);
+      { const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = r() * 2 - 1; }
+      for (let i = 0; i < 8; i++) splashes.push(makeSplash());
+      for (let i = 0; i < 32; i++) grains.push(makeGrain());
+      for (let i = 0; i < 8; i++) fizzes.push(makeFizz());
+      // the waterfall, 2 km away: a steady roar of countless bubbles; the air soaks up its highs on the way,
+      // leaving a smooth low rumble that swells and fades as the breeze carries it
+      const roar = ctx.createBuffer(2, sr * 8, sr);
+      for (let c = 0; c < 2; c++) {
+        const d = roar.getChannelData(c); let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+        for (let i = 0; i < d.length; i++) {   // pink noise (Kellet)
+          const w = r() * 2 - 1;
+          b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759; b2 = 0.969 * b2 + w * 0.153852;
+          b3 = 0.8665 * b3 + w * 0.3104856; b4 = 0.55 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.016898;
+          d[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11; b6 = w * 0.115926;
+        }
+      }
+      const rs = ctx.createBufferSource(); rs.buffer = roar; rs.loop = true;
+      const rlp = ctx.createBiquadFilter(); rlp.type = 'lowpass'; rlp.frequency.value = 1400; rlp.Q.value = 0.3;
+      const rsh = ctx.createBiquadFilter(); rsh.type = 'lowshelf'; rsh.frequency.value = 180; rsh.gain.value = 6;
+      const rg = ctx.createGain(); rg.gain.value = 0.11;
+      for (const [hz, depth] of [[0.05, 0.025], [0.13, 0.015]]) {
+        const o = ctx.createOscillator(), og = ctx.createGain(); o.frequency.value = hz; og.gain.value = depth;
+        o.connect(og).connect(rg.gain); o.start();
+      }
+      const rp = ctx.createStereoPanner(); rp.pan.value = 0.35;     // the falls are on the right-hand ridge
+      rs.connect(rlp).connect(rsh).connect(rg).connect(rp).connect(master);
+      const rv = ctx.createGain(); rv.gain.value = 0.4; rg.connect(rv).connect(verb);
+      rs.start();
+      // wind through the trees
+      const wf = ctx.createBiquadFilter(), wg = ctx.createGain(), lfo = ctx.createOscillator(), lg = ctx.createGain();
+      wf.type = 'bandpass'; wf.frequency.value = 420; wf.Q.value = 0.35; wg.gain.value = 0.018;
+      lfo.frequency.value = 0.06; lg.gain.value = 0.013; lfo.connect(lg).connect(wg.gain); lfo.start();
+      noiseSrc().connect(wf).connect(wg).connect(master);
+      // body of water pushed by the hand
+      sloshF = ctx.createBiquadFilter(); slosh = ctx.createGain();
+      sloshF.type = 'lowpass'; sloshF.frequency.value = 400; slosh.gain.value = 0;
+      noiseSrc().connect(sloshF).connect(slosh).connect(master);
+      lapLoop(); setTimeout(bird, 900);
+    },
+    stir(speed, dt, holding) {
+      if (!ctx) return;
+      const now = ctx.currentTime;
+      slosh.gain.setTargetAtTime(Math.min(speed * 0.014, 0.08) * (holding ? 1.4 : 1), now, 0.12);
+      sloshF.frequency.setTargetAtTime(280 + Math.min(speed, 8) * 70, now, 0.15);
+      let n = Math.min(speed, 10) * dt * (holding ? 7 : 4);     // bubbles shed in the wake
+      while (r() < n) { play(pick(grains), 0.12 + r() * 0.12, (holding ? 0.8 : 1) + r() * 0.25, 0.15); n -= 1; }
+    },
+    splash(power) {
+      if (!ctx) return;
+      play(pick(splashes), 0.8 * power, 0.92 + r() * 0.16, 0.35);
+    },
+    toggle() {
+      muted = !muted;
+      if (master) master.gain.setTargetAtTime(muted ? 0 : 0.9, ctx.currentTime, 0.05);
+      return muted;
+    },
+  };
+})();
+const muteBtn = document.getElementById('mute');
+muteBtn.addEventListener('pointerdown', e => e.stopPropagation());
+muteBtn.addEventListener('click', () => {
+  const m = audio.toggle();
+  document.getElementById('waves').style.display = m ? 'none' : '';
+  muteBtn.setAttribute('aria-label', m ? 'Unmute sound' : 'Mute sound');
+});
+
+// ---------- cursor ----------
+const cur = { x: 0, z: 0 }, prev = { x: 0, z: 0 };
+let has = false, hasPrev = false, holding = false;
+const hint = document.getElementById('hint');
+let hintGone = false;
+function toWater(e) {
+  const gy = lay.H - e.clientY;
+  if (gy >= lay.hor - 2) return false;
+  const z = CAM_H * lay.f / (lay.hor - gy);
+  const x = (e.clientX - lay.W / 2) * z / lay.f;
+  cur.x = x; cur.z = z;
+  return z > shoreZ(x) + 0.03 && z < SIM_ZMAX * 0.9 && Math.abs(x / z) < SIM_S * 0.48;
+}
+addEventListener('pointermove', e => { has = toWater(e); });
+addEventListener('pointerdown', e => {
+  holding = true;
+  audio.start();
+  if (toWater(e)) {
+    has = true;
+    addDrop(cur, cur, 0.17, -0.16);
+    audio.splash(0.55 + 0.45 * Math.min(1, 4 / cur.z));
+    if (!hintGone) { hintGone = true; setTimeout(() => hint.style.opacity = 0, 2000); }
+  }
+});
+addEventListener('pointerup', () => { holding = false; });
+addEventListener('pointercancel', () => { holding = false; has = false; });
+document.addEventListener('pointerleave', () => { has = false; holding = false; });
+addEventListener('blur', () => { holding = false; });
+
+function interact(dt, t) {
+  if (!has) { hasPrev = false; audio.stir(0, dt, false); return; }
+  if (hasPrev) {
+    const speed = Math.hypot(cur.x - prev.x, cur.z - prev.z) / dt;
+    const k = holding ? 1.7 : 1;
+    const s = Math.min(speed * 0.003, 0.03) * k;
+    if (s > 0.0003) addDrop(prev, cur, holding ? 0.18 : 0.12, -s);
+    if (holding) addDrop(cur, cur, 0.13, Math.sin(t * 13) * 0.012);
+    audio.stir(speed * Math.min(1, 5 / cur.z), dt, holding);   // farther water is heard more faintly
+  }
+  prev.x = cur.x; prev.z = cur.z; hasPrev = true;
+}
+
+// ---------- loop ----------
+const clock = new THREE.Clock();
+let acc = 0;
+renderer.setAnimationLoop(() => {
+  // an error in one frame must never stop the loop for good
+  try { frame(); } catch (err) { console.error(err); }
+});
+function frame() {
+  const dt = Math.max(Math.min(clock.getDelta(), 0.05), 1e-3), t = clock.elapsedTime;
+
+  // build the valley progressively (top strips first, so the sky and peaks appear before the shoreline)
+  if (strip < STRIPS) {
+    const h = Math.ceil(terrainRT.height / STRIPS), y = terrainRT.height - (strip + 1) * h;
+    terrainRT.scissor.set(0, Math.max(0, y), terrainRT.width, h + Math.min(0, y));
+    draw(terrainMat, terrainRT);
+    if (++strip === STRIPS) {
+      terrainMat.uniforms.uMode.value = 1; draw(terrainMat, wfRT); terrainMat.uniforms.uMode.value = 0;
+      loading.style.opacity = 0;
+    }
+  }
+
+  interact(dt, t);
+  for (const d of drops) {
+    dropMat.uniforms.uA.value.copy(d.a); dropMat.uniforms.uB.value.copy(d.b);
+    dropMat.uniforms.uRadius.value = d.r; dropMat.uniforms.uStrength.value = d.s;
+    simPass(dropMat);
+  }
+  drops.length = 0;
+  acc += dt;
+  let n = 0;
+  while (acc >= 1 / 60 && n < 3) { simPass(updateMat); acc -= 1 / 60; n++; }
+  if (n === 3) acc = 0;
+  simPass(normalMat);
+
+  envMat.uniforms.uTime.value = t;
+  draw(envMat, envRT);
+
+  U.uSim.value = simA.texture;
+  U.uTime.value = t;
+  draw(sceneMat, null);
+}
+</script>
+</body>
+</html>
